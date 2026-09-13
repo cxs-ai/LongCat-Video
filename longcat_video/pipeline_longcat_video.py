@@ -80,6 +80,10 @@ class LongCatVideoPipeline:
         self.dit = dit 
         self.device = "cuda"
 
+        # When True the text encoder stays on CPU and is moved to the GPU only
+        # for the duration of encode_prompt(). See enable_text_encoder_offload().
+        self.offload_text_encoder = False
+
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
@@ -154,6 +158,9 @@ class LongCatVideoPipeline:
                 torch dtype
         """
 
+        if self.offload_text_encoder and self.text_encoder is not None:
+            self.text_encoder = self.text_encoder.to(device or self.device)
+
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -185,7 +192,11 @@ class LongCatVideoPipeline:
         else:
             negative_prompt_embeds = None
             negative_prompt_attention_mask = None
-            
+
+        if self.offload_text_encoder and self.text_encoder is not None:
+            self.text_encoder = self.text_encoder.to("cpu")
+            torch.cuda.empty_cache()
+
         return prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask
 
     def check_inputs(
@@ -1337,6 +1348,28 @@ class LongCatVideoPipeline:
         return output_video
     
 
+    def enable_text_encoder_offload(self, enable: bool = True):
+        """Keep the text encoder on CPU except while a prompt is being encoded.
+
+        UMT5-XXL is ~11.4 GB at bf16, against the DiT's ~27.2 GB. It runs once
+        per generation, inside encode_prompt(), and is then idle for every
+        denoising step that follows. Leaving it resident therefore costs ~11 GB
+        of VRAM for the whole loop and buys nothing.
+
+        Enabling this cuts peak VRAM by roughly 11 GB. The cost is two
+        host<->device transfers per generation, which is seconds against a
+        multi-minute denoise. Output is bit-identical: nothing about the
+        computation changes, only where the weights sit between uses.
+
+        Safe with chained segments -- each encode_prompt() pulls the encoder
+        back in and releases it again.
+        """
+        self.offload_text_encoder = enable
+        if enable and self.text_encoder is not None:
+            self.text_encoder = self.text_encoder.to("cpu")
+            torch.cuda.empty_cache()
+        return self
+
     def to(self, device: str | torch.device):
         """
         Move pipeline to specified device.
@@ -1354,7 +1387,7 @@ class LongCatVideoPipeline:
                 for lora_key, lora_network in self.dit.lora_dict.items():
                     for lora in lora_network.loras:
                         lora.to(device, non_blocking=True)
-        if self.text_encoder is not None:
+        if self.text_encoder is not None and not self.offload_text_encoder:
             self.text_encoder = self.text_encoder.to(device, non_blocking=True)
         if self.vae is not None:
             self.vae = self.vae.to(device, non_blocking=True)
