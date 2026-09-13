@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 
 import cv2
 import torch
@@ -36,8 +37,71 @@ def get_fps(video_path):
     return original_fps
 
 @st.cache_resource
+def _generation_lock():
+    """One lock for the whole process, shared by every browser session.
+
+    @st.cache_resource hands the SAME pipeline object to every session, and
+    generate_* mutates state on it -- self.scheduler._step_index above all,
+    which set_timesteps() resets to None and step() increments. Two sessions
+    generating at once therefore share one counter: each step() advances it
+    for both, one run walks off the end of a 51-entry sigmas array, and the
+    generation dies with
+
+        IndexError: index 51 is out of bounds for dimension 0 with size 51
+        scheduling_flow_match_euler_discrete.py:450  sigma_next = self.sigmas[sigma_idx + 1]
+
+    which says nothing about the real cause. Observed exactly that way: a
+    browser tab and an automated run generating simultaneously, both at 50
+    steps, one of them dead at the last step after 28 minutes of GPU.
+
+    It is also the only sane behaviour on one card -- two concurrent
+    generations do not run twice as fast, they contend for VRAM (measured:
+    24.8 s/step alone, 73 s/step with two) and then one OOMs. Serialising
+    makes the second person wait instead of corrupting both.
+
+    Must be cached, not a module global: Streamlit re-executes this script per
+    session, so a bare `threading.Lock()` at module scope would hand every
+    session its own lock and guard nothing.
+    """
+    return threading.Lock()
+
+
+@st.cache_resource
+def _loaded_checkpoint_dirs():
+    """Which checkpoint dirs already have a pipeline resident in this process.
+
+    load_model is cached on checkpoint_dir, so editing the Model Dir box is a
+    cache MISS and starts a second, complete load -- while the first pipeline
+    is still resident and possibly mid-generation. There is no room for that.
+    Loading peaks around 37 GB of host RSS against this pod's 47.6 GB cgroup
+    cap, so a second copy cannot fit, and the failure mode is not a tidy
+    exception: the kernel OOM-kills the whole Streamlit process, taking the
+    resident model, any in-flight generation and every connected session.
+
+    Observed exactly that way: rss climbed 35 -> 43 GB in sixty seconds while
+    reclaimable cache fell to 4 GB, then oom_kill went 0 -> 1 and killed a
+    generation at step 24 of 50.
+
+    So refuse the second load and say why. Changing checkpoint means
+    restarting the app, which is the honest answer.
+    """
+    return set()
+
+
+@st.cache_resource
 def load_model(checkpoint_dir):
-    """Load model, use cache to avoid reloading"""    
+    """Load model, use cache to avoid reloading"""
+    _already = _loaded_checkpoint_dirs()
+    if _already and checkpoint_dir not in _already:
+        st.error(
+            f"A model is already loaded from `{sorted(_already)[0]}`.\n\n"
+            f"Loading `{checkpoint_dir}` as well needs a second copy in host RAM, "
+            f"which exceeds this machine's memory cap and gets the whole app "
+            f"OOM-killed -- losing the resident model and any generation in flight.\n\n"
+            f"Restart the app to use a different Model Dir."
+        )
+        st.stop()
+
     # Check GPU availability
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
@@ -58,13 +122,33 @@ def load_model(checkpoint_dir):
             dit=dit,
         )
         pipe.to(device)
-        
+
+        # Park UMT5-XXL on CPU between prompts. It is ~11.4 GB, runs once per
+        # generation inside encode_prompt(), and is idle for every denoising
+        # step after -- so on a 44 GiB card it is 11.4 GB of pure overhead.
+        #
+        # This matters more in the UI than in the CLI runner, because the UI
+        # also calls dit.enable_loras(), and enable_loras moves the LoRA onto
+        # the model's device: cfg_step_lora is +2.35 GB of VRAM the runner
+        # never pays. Weights 37.3 + lora 2.35 = ~39.6 GB left roughly 4 GB for
+        # activations, and a 480p i2v run died asking for 588 MB more. With the
+        # encoder parked the same run has ~16 GB of headroom.
+        #
+        # hasattr guard: the method only exists on our fork (see
+        # patches/longcat-video-text-encoder-offload.patch). Upstream checkouts
+        # keep the old behaviour rather than crashing.
+        if hasattr(pipe, 'enable_text_encoder_offload'):
+            pipe.enable_text_encoder_offload()
+
         cfg_step_lora_path = os.path.join(checkpoint_dir, 'lora/cfg_step_lora.safetensors')
         pipe.dit.load_lora(cfg_step_lora_path, 'cfg_step_lora')
 
         refinement_lora_path = os.path.join(checkpoint_dir, 'lora/refinement_lora.safetensors')
         pipe.dit.load_lora(refinement_lora_path, 'refinement_lora')
-    
+
+    # Only after a COMPLETE load: a failed attempt must not lock out retries.
+    _loaded_checkpoint_dirs().add(checkpoint_dir)
+
     return pipe, device
 
 def main():
@@ -195,8 +279,11 @@ def main():
             generator = torch.Generator(device=device)
             generator.manual_seed(seed)
             
-            # Generate video according to mode
-            with st.spinner('Generating video, please wait...'):
+            # Generate video according to mode.
+            #
+            # Serialised: the pipeline is shared across sessions and is not
+            # safe to drive concurrently. See _generation_lock().
+            with _generation_lock(), st.spinner('Generating video, please wait...'):
                 if mode == "t2v":
                     if use_distill:
                         pipe.dit.enable_loras(['cfg_step_lora'])
